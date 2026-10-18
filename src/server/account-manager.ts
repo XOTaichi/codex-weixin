@@ -180,6 +180,7 @@ export class AccountManager {
       onSyncKey: (syncKey) => store.setSyncKey(syncKey),
       claimMessage: (message) => store.claimProcessedMessage(message.id),
       onMessage: (message) => service.handleMessage(message),
+      isPriorityMessage: (message) => service.isPriorityMessage(message),
       onMessageError: async (error, message) => {
         await client.sendText({
           toUserId: message.senderId,
@@ -204,6 +205,7 @@ export class AccountManager {
     const account = persist ? setAccountEnabled(this.options.paths, accountId, false) : loadAccount(this.options.paths, accountId);
     const entry = this.entries.get(account.accountId);
     if (entry) {
+      entry.service?.cancelPendingApprovals();
       entry.controller?.abort();
       await entry.task;
       entry.status = "stopped";

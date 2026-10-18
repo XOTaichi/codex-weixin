@@ -4,7 +4,8 @@ import { AccessController } from "./access.js";
 import { parseActionBlocks } from "./actions.js";
 import { buildPrompt, buildPromptPreview, chunkText, parsePrompt } from "./format.js";
 import { PromptBuffer } from "./prompt-buffer.js";
-import type { CodexModelOption, CodexRuntimeInfo } from "../codex/app-server-runner.js";
+import { CodexThreadUnavailableError, type CodexApprovalRequest, type CodexModelOption, type CodexRunnerInput, type CodexRuntimeInfo } from "../codex/app-server-runner.js";
+import type { CodexRunResult } from "../codex/exec-runner.js";
 import { HybridCodexRunner } from "../codex/runner.js";
 import { isWorkspaceAllowed, type CodexWeixinConfig } from "../state/config.js";
 import { RuntimeStateStore, type ManagedSession } from "../state/runtime-state.js";
@@ -24,10 +25,16 @@ export type BridgeServiceOptions = {
   onTurnStatus?: (status: { senderId: string; sessionId: string; active: boolean }) => void;
 };
 
+type PendingApproval = {
+  request: CodexApprovalRequest;
+  resolve: (approved: boolean) => void;
+};
+
 export class BridgeService {
   private readonly access: AccessController;
   private readonly buffers: PromptBuffer;
   private readonly runner: HybridCodexRunner;
+  private readonly pendingApprovals = new Map<string, PendingApproval[]>();
 
   constructor(private readonly options: BridgeServiceOptions) {
     this.access = new AccessController({
@@ -78,6 +85,19 @@ export class BridgeService {
     await this.runCodexTurn(message, "", items);
   }
 
+  isPriorityMessage(message: NormalizedWeixinMessage): boolean {
+    return /^\/(approve|reject|stop)(?:\s|$)/i.test(message.text.trim());
+  }
+
+  cancelPendingApprovals(): void {
+    for (const queue of this.pendingApprovals.values()) {
+      for (const pending of queue) {
+        pending.resolve(false);
+      }
+    }
+    this.pendingApprovals.clear();
+  }
+
   private async handleCommand(message: NormalizedWeixinMessage, command: { name: string; arg: string }): Promise<void> {
     switch (command.name) {
       case "help":
@@ -111,8 +131,13 @@ export class BridgeService {
         await this.handlePromptCommand(message.senderId, command.arg);
         return;
       case "stop":
+        this.rejectApprovals(message.senderId);
         await this.runner.stop(this.options.stateStore.getThread(message.senderId));
         await this.reply(message.senderId, "Stop signal sent.");
+        return;
+      case "approve":
+      case "reject":
+        await this.answerApproval(message.senderId, command.name === "approve");
         return;
       default:
         await this.reply(message.senderId, `Unknown command: /${command.name}. Send /help.`);
@@ -364,7 +389,7 @@ export class BridgeService {
   }
 
   private async runCodexTurn(message: NormalizedWeixinMessage, text: string, attachments: PromptBufferItem[] = []): Promise<void> {
-    const session = this.options.stateStore.ensureActiveSession(message.senderId, this.options.config.defaultCwd);
+    let session = this.options.stateStore.ensureActiveSession(message.senderId, this.options.config.defaultCwd);
     const promptPreview = buildPromptPreview(text, attachments);
     if (promptPreview) {
       this.options.stateStore.setSessionPromptPreview(session.id, promptPreview);
@@ -377,12 +402,13 @@ export class BridgeService {
     try {
       await this.withTyping(message.senderId, async () => {
         console.log(`[codex-weixin] starting Codex turn for ${message.senderId} in ${workspace}`);
-        const result = await this.runner.run({
+        const runInput: CodexRunnerInput = {
           prompt: buildPrompt(text, attachments),
           cwd: workspace,
           threadId,
           model: session.model ?? this.options.config.model,
           effort: session.effort ?? this.options.config.effort,
+          onApproval: (request) => this.requestApproval(message.senderId, request),
           ...(progressEnabled ? {
             onProgress: async (progress: string) => {
               const progressText = progress.trim();
@@ -391,7 +417,25 @@ export class BridgeService {
               await this.reply(message.senderId, `【进度】${progressText}`);
             }
           } : {})
-        });
+        };
+        let result: CodexRunResult;
+        try {
+          result = await this.runner.run(runInput);
+        } catch (error) {
+          if (!(error instanceof CodexThreadUnavailableError) || !threadId) throw error;
+          this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: false });
+          const previousSession = session;
+          session = this.options.stateStore.createSession(message.senderId, workspace);
+          if (previousSession.model) this.options.stateStore.setModelOverride(message.senderId, previousSession.model);
+          if (previousSession.effort) this.options.stateStore.setEffortOverride(message.senderId, previousSession.effort);
+          if (typeof previousSession.streamReplies === "boolean") {
+            this.options.stateStore.setStreamRepliesOverride(message.senderId, previousSession.streamReplies);
+          }
+          if (promptPreview) this.options.stateStore.setSessionPromptPreview(session.id, promptPreview);
+          this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: true });
+          await this.reply(message.senderId, "原 Codex 会话无法恢复，已保留旧会话记录并新建上下文继续处理这条消息。");
+          result = await this.runner.run({ ...runInput, threadId: undefined });
+        }
         console.log(`[codex-weixin] Codex turn completed for ${message.senderId}; text=${result.text.length} chars`);
         if (result.threadId) {
           this.options.stateStore.setThread(message.senderId, result.threadId);
@@ -408,7 +452,65 @@ export class BridgeService {
         }
       });
     } finally {
+      this.rejectApprovals(message.senderId);
       this.options.onTurnStatus?.({ senderId: message.senderId, sessionId: session.id, active: false });
+    }
+  }
+
+  private async requestApproval(senderId: string, request: CodexApprovalRequest): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const queue = this.pendingApprovals.get(senderId) ?? [];
+      queue.push({ request, resolve });
+      this.pendingApprovals.set(senderId, queue);
+      if (queue.length === 1) this.showNextApproval(senderId);
+    });
+  }
+
+  private showNextApproval(senderId: string): void {
+    const pending = this.pendingApprovals.get(senderId)?.[0];
+    if (!pending) return;
+    const { request } = pending;
+    const params = request.params;
+    const detail = [params.reason, Array.isArray(params.command) ? params.command.join(" ") : params.command,
+      params.cwd, params.grantRoot]
+      .filter((value): value is string => typeof value === "string" && Boolean(value.trim()))
+      .join("\n");
+    const permissionDetail = request.method === "item/permissions/requestApproval"
+      ? `\n请求权限：${JSON.stringify(params.permissions ?? {})}` : "";
+    const prompt = `Codex 请求批准：${request.method}\n${detail}${permissionDetail}\n\n同意：/approve\n不同意：/reject\n会一直等待你的回复。`;
+    void (async () => {
+      for (const chunk of chunkText(prompt)) await this.reply(senderId, chunk, true);
+    })().catch((error) => {
+      this.finishApproval(senderId, pending, false);
+      console.warn(`Unable to send Codex approval request: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
+
+  private async answerApproval(senderId: string, approved: boolean): Promise<void> {
+    const pending = this.pendingApprovals.get(senderId)?.[0];
+    if (!pending) {
+      await this.reply(senderId, "当前没有等待审批的请求。");
+      return;
+    }
+    this.finishApproval(senderId, pending, approved);
+    await this.reply(senderId, approved ? "已同意，Codex 正在继续。" : "已拒绝，Codex 正在继续。");
+  }
+
+  private finishApproval(senderId: string, pending: PendingApproval, approved: boolean): void {
+    const queue = this.pendingApprovals.get(senderId);
+    if (queue?.[0] !== pending) return;
+    queue.shift();
+    if (queue.length === 0) this.pendingApprovals.delete(senderId);
+    pending.resolve(approved);
+    if (queue.length) this.showNextApproval(senderId);
+  }
+
+  private rejectApprovals(senderId: string): void {
+    const queue = this.pendingApprovals.get(senderId);
+    if (!queue) return;
+    this.pendingApprovals.delete(senderId);
+    for (const pending of queue) {
+      pending.resolve(false);
     }
   }
 
@@ -494,14 +596,14 @@ export class BridgeService {
     };
   }
 
-  private async reply(senderId: string, text: string): Promise<void> {
+  private async reply(senderId: string, text: string, throwOnStaleContext = false): Promise<void> {
     const contextToken = this.options.stateStore.getContextToken(senderId);
     try {
       console.log(`[codex-weixin] sending reply to ${senderId}; text=${text.length} chars`);
       await this.options.weixin.sendText({ toUserId: senderId, text, contextToken });
       console.log(`[codex-weixin] sent reply to ${senderId}`);
     } catch (error) {
-      if (isStaleContextError(error)) {
+      if (isStaleContextError(error) && !throwOnStaleContext) {
         console.warn(`WeChat context token is stale for ${senderId}; ask user to send a fresh message.`);
         return;
       }
@@ -546,7 +648,9 @@ function helpText(): string {
     "/stream [on|off|default] - view or switch streaming replies",
     "/prompt start - buffer multiple WeChat messages",
     "/prompt done - submit buffered prompt",
-    "/stop - interrupt the current Codex task"
+    "/stop - interrupt the current Codex task",
+    "/approve - approve the current Codex request",
+    "/reject - reject the current Codex request"
   ].join("\n");
 }
 

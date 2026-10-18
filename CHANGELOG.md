@@ -2,6 +2,22 @@
 
 All notable changes to `codex-weixin` are documented in this file.
 
+## Unreleased
+
+### Added
+
+- Forward Codex app-server approval requests from WeChat turns to the requesting contact and resume the original request after a sender-scoped `/approve` or `/reject` reply. Show one request at a time per contact.
+- Continue polling while a Codex turn waits for approval, with no approval timeout; `/stop` or service shutdown still cancels the pending request.
+
+### Fixed
+
+- Start a new managed session and retry the pending WeChat message when Codex reports that the saved thread rollout cannot be found.
+- Run WeChat turns in the bound workspace with `workspaceWrite` access and network enabled, so routine commands there do not require approval even when the local Codex default is more restrictive.
+
+### Known limitation
+
+- Native WeChat approval buttons remain unavailable through the documented iLink message item types; the text commands are the current fallback.
+
 ## [0.3.8] - 2026-07-20
 
 ### Fixed

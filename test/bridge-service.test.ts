@@ -6,12 +6,132 @@ import path from "node:path";
 import test from "node:test";
 
 import { BridgeService } from "../src/bridge/service.js";
+import { CodexThreadUnavailableError } from "../src/codex/app-server-runner.js";
 import { buildPrompt } from "../src/bridge/format.js";
 import { defaultConfig, MAX_INBOUND_BYTES } from "../src/state/config.js";
 import { resolveStatePaths } from "../src/state/paths.js";
 import { RuntimeStateStore } from "../src/state/runtime-state.js";
 import { encryptAesEcb } from "../src/weixin/media.js";
 import { normalizeWeixinMessage } from "../src/weixin/messages.js";
+import { WeixinApiError } from "../src/weixin/api.js";
+
+test("accepts a bare approval command only from the requesting WeChat sender", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-approval-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const replies: Array<{ senderId: string; text: string }> = [];
+  let approvalResult: boolean | undefined;
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice", "bob"] },
+    stateStore: new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state"))),
+    weixin: { async sendTyping() {}, async sendText(input: { toUserId: string; text: string }) {
+      replies.push({ senderId: input.toUserId, text: input.text });
+      return { messageId: "reply" };
+    } } as never,
+    runner: { async run(input: { onApproval: (request: { method: string; params: Record<string, unknown> }) => Promise<boolean> }) {
+      approvalResult = await input.onApproval({ method: "item/commandExecution/requestApproval",
+        params: { command: "touch approved", reason: "test" } });
+      return { raw: "", text: "done", threadId: "thread" };
+    }, async stop() {} } as never
+  });
+  const incoming = (senderId: string, text: string) => ({ id: crypto.randomUUID(), senderId, text, attachments: [], raw: {} });
+  const turn = service.handleMessage(incoming("alice", "work"));
+  for (let attempt = 0; attempt < 50 && !replies.length; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.match(replies[0]?.text ?? "", /同意：\/approve\n不同意：\/reject/);
+  assert.match(replies[0]?.text ?? "", /会一直等待你的回复/);
+  assert.equal(replies[0].senderId, "alice");
+  await service.handleMessage(incoming("bob", "/approve"));
+  assert.equal(approvalResult, undefined);
+  await service.handleMessage(incoming("alice", "/approve"));
+  await turn;
+  assert.equal(approvalResult, true);
+});
+
+test("shows one approval at a time and applies bare commands in order", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-approval-queue-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const replies: string[] = [];
+  const decisions: boolean[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice"] },
+    stateStore: new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state"))),
+    weixin: { async sendTyping() {}, async sendText(input: { text: string }) {
+      replies.push(input.text);
+      return { messageId: "reply" };
+    } } as never,
+    runner: { async run(input: { onApproval: (request: { method: string; params: Record<string, unknown> }) => Promise<boolean> }) {
+      decisions.push(...await Promise.all([
+        input.onApproval({ method: "item/commandExecution/requestApproval", params: { command: "first" } }),
+        input.onApproval({ method: "item/commandExecution/requestApproval", params: { command: "second" } })
+      ]));
+      return { raw: "", text: "done", threadId: "thread" };
+    }, async stop() {} } as never
+  });
+  const incoming = (id: string, text: string) => ({ id, senderId: "alice", text, attachments: [], raw: {} });
+  const turn = service.handleMessage(incoming("turn", "work"));
+  for (let attempt = 0; attempt < 50 && !replies.length; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.match(replies[0] ?? "", /first/);
+  assert.ok(!replies.some((reply) => reply.includes("second")));
+  await service.handleMessage(incoming("approve", "/approve"));
+  assert.ok(replies.some((reply) => reply.includes("second")));
+  await service.handleMessage(incoming("reject", "/reject"));
+  await turn;
+  assert.deepEqual(decisions, [true, false]);
+});
+
+test("declines immediately when an approval prompt cannot be delivered", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-approval-fail-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  let approved: boolean | undefined;
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice"] },
+    stateStore: new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state"))),
+    weixin: { async sendTyping() {}, async sendText() {
+      throw new WeixinApiError("stale context", "sendmessage", -2);
+    } } as never,
+    runner: { async run(input: { onApproval: (request: { method: string; params: Record<string, unknown> }) => Promise<boolean> }) {
+      approved = await input.onApproval({ method: "item/fileChange/requestApproval", params: { reason: "write" } });
+      return { raw: "", text: "done", threadId: "thread" };
+    }, async stop() {} } as never
+  });
+  await service.handleMessage({ id: "turn", senderId: "alice", contextToken: "expired", text: "work", attachments: [], raw: {} });
+  assert.equal(approved, false);
+});
+
+test("starts a fresh managed session when the saved Codex rollout cannot be resumed", async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-missing-thread-"));
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+  const store = new RuntimeStateStore(resolveStatePaths(path.join(tmpDir, "state")));
+  const original = store.createSession("alice", tmpDir, "Original");
+  store.setThread("alice", "thread-missing");
+  store.setModelOverride("alice", "test-model");
+  const runs: Array<{ threadId?: string; prompt: string }> = [];
+  const replies: string[] = [];
+  const service = new BridgeService({
+    config: { ...defaultConfig(tmpDir), allowedSenderIds: ["alice"] },
+    stateStore: store,
+    weixin: { async sendTyping() {}, async sendText(input: { text: string }) {
+      replies.push(input.text);
+      return { messageId: "reply" };
+    } } as never,
+    runner: { async run(input: { threadId?: string; prompt: string }) {
+      runs.push({ threadId: input.threadId, prompt: input.prompt });
+      if (input.threadId) throw new CodexThreadUnavailableError(input.threadId);
+      return { raw: "", text: "finished", threadId: "thread-new" };
+    }, async stop() {} } as never
+  });
+  await service.handleMessage({ id: "turn", senderId: "alice", text: "do work", attachments: [], raw: {} });
+  assert.deepEqual(runs.map((run) => run.threadId), ["thread-missing", undefined]);
+  assert.equal(runs[0].prompt, runs[1].prompt);
+  assert.equal(store.listSessions().find((session) => session.id === original.id)?.threadId, "thread-missing");
+  assert.equal(store.getActiveSession("alice")?.threadId, "thread-new");
+  assert.equal(store.getActiveSession("alice")?.model, "test-model");
+  assert.ok(replies.some((reply) => reply.includes("新建上下文")));
+  assert.ok(replies.includes("finished"));
+});
 
 test("reports WeChat Codex turn status and resolves runtime details for status", async (t) => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-weixin-status-"));

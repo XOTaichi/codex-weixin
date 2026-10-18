@@ -34,14 +34,14 @@ export class HybridCodexRunner {
   }
 
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
-    const requiresAppServerForStreaming = Boolean(input.onDelta || input.onProgress);
-    if (this.options.backend === "exec" && !requiresAppServerForStreaming) {
+    const requiresAppServer = Boolean(input.onDelta || input.onProgress || input.onApproval);
+    if (this.options.backend === "exec" && !requiresAppServer) {
       return this.exec.run(input);
     }
     try {
       return await this.appServer.run(input);
     } catch (error) {
-      if (this.options.backend === "app-server") {
+      if (this.options.backend === "app-server" || input.onApproval) {
         throw error;
       }
       const fallback = await this.exec.run({

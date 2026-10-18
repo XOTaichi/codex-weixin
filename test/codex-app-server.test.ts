@@ -3,7 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { AppServerCodexRunner } from "../src/codex/app-server-runner.js";
+import { AppServerCodexRunner, CodexThreadUnavailableError } from "../src/codex/app-server-runner.js";
 import { HybridCodexRunner } from "../src/codex/runner.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
@@ -116,6 +116,66 @@ test("interrupts the active V2 turn with both threadId and turnId", async (t) =>
   }
   const result = await outcome;
   assert.match(result.error?.message ?? "", /interrupted/i);
+});
+
+test("forwards an approval request and resumes with the user's decision", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  const requests: string[] = [];
+  const result = await runner.run({
+    prompt: "approval",
+    cwd: "/tmp/project",
+    onApproval: async (request) => {
+      requests.push(`${request.method}:${request.params.command}`);
+      return true;
+    }
+  });
+  assert.deepEqual(requests, ["item/commandExecution/requestApproval:touch approved"]);
+  assert.equal(result.text, "approval:accept");
+  const rejected = await runner.run({
+    prompt: "approval",
+    cwd: "/tmp/project",
+    onApproval: async () => false
+  });
+  assert.equal(rejected.text, "approval:decline");
+  const permissions = await runner.run({
+    prompt: "permissions",
+    cwd: "/tmp/project",
+    onApproval: async () => true
+  });
+  assert.equal(permissions.text, 'approval:{"permissions":{"network":{"enabled":true}},"scope":"turn"}');
+});
+
+test("pauses the turn timeout while waiting for WeChat approval", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 200
+  });
+  t.after(() => runner.close());
+  const result = await runner.run({
+    prompt: "approval",
+    cwd: "/tmp/project",
+    onApproval: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return true;
+    }
+  });
+  assert.equal(result.text, "approval:accept");
+});
+
+test("identifies a missing rollout before starting a turn", async (t) => {
+  const runner = new AppServerCodexRunner({
+    codexBin: path.join(fixturesDir, "fake-codex-app-server.mjs"),
+    requestTimeoutMs: 2_000
+  });
+  t.after(() => runner.close());
+  await assert.rejects(
+    runner.run({ prompt: "work", cwd: "/tmp/project", threadId: "thread-missing" }),
+    (error: unknown) => error instanceof CodexThreadUnavailableError && error.threadId === "thread-missing"
+  );
 });
 
 test("auto backend falls back to codex exec for an existing thread", async (t) => {

@@ -68,6 +68,8 @@ function setup(t: test.TestContext) {
     clientFactory: (account) => ({ accountId: account.accountId }) as never,
     bridgeFactory: (input) => ({
       handleMessage: async () => {},
+      isPriorityMessage: () => false,
+      cancelPendingApprovals: () => {},
       allowSender(senderId: string) {
         input.stateStore.setPairedSenderIds([...input.stateStore.listPairedSenderIds(), senderId]);
       },

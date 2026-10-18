@@ -127,6 +127,8 @@ The UI uses local remarks instead of treating internal IDs as account names. Exp
 /prompt start                 Buffer multiple WeChat messages
 /prompt done                  Submit the buffer as one Codex turn
 /stop                         Interrupt the current Codex task
+/approve                      Approve the current permission request
+/reject                       Reject the current permission request
 ```
 
 Regular messages enter the active session. Images, files, videos, and voice/audio without transcription are saved under the account's inbound directory and added to the prompt by local path. WeChat voice transcription is preferred when available.
@@ -151,9 +153,9 @@ Only absolute local paths are accepted. Native outbound types are `image`, `vide
 
 ## Codex backend
 
-The default `codexBackend` is `auto`. On the first Codex message, the service starts one persistent `codex app-server --stdio` process and uses the current `initialize`, `thread/*`, and `turn/*` protocol. New and resumed conversations prefer app-server; startup, handshake, or request failures automatically fall back to `codex exec` or `codex exec resume`.
+The default `codexBackend` is `auto`. On the first Codex message, the service starts one persistent `codex app-server --stdio` process and uses the current `initialize`, `thread/*`, and `turn/*` protocol. New and resumed conversations prefer app-server. Turns without interactive approval handling can fall back to `codex exec` or `codex exec resume` when app-server is unavailable. WeChat-initiated turns require app-server for approvals and report an error if it is unavailable.
 
-WeChat does not currently expose Codex approval prompts, so app-server uses `approvalPolicy: "never"` and operates only within the configured Codex sandbox instead of waiting for an approval that cannot be answered in WeChat. The management page can still pin the backend to `app-server` or `exec` for diagnostics.
+WeChat-initiated Codex turns use app-server with `approvalPolicy: "on-request"` and a `workspaceWrite` sandbox scoped to the bound workspace, with network access enabled. Commands that run within this sandbox proceed without approval. When Codex needs permission beyond it, the service sends the requesting WeChat contact the details. Reply with `/approve` or `/reject` to answer the current request. Requests for the same contact are shown one at a time; other contacts cannot answer them. An unanswered request waits indefinitely while the service keeps running; `/stop` or stopping the service cancels it. The current iLink message API has no verified native button format, so text commands are used for now. Web-initiated turns retain their existing approval behavior.
 
 ## Models and reasoning effort
 

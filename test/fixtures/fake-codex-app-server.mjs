@@ -6,6 +6,7 @@ const rl = readline.createInterface({ input: process.stdin });
 let initialized = false;
 let nextTurn = 1;
 const activeTurns = new Map();
+let pendingApproval;
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -34,6 +35,17 @@ function completedTurn(id, status, error = null) {
 
 rl.on("line", (line) => {
   const message = JSON.parse(line);
+  if (message.id === "approval-1" && !message.method && pendingApproval) {
+    const { threadId, turnId } = pendingApproval;
+    pendingApproval = undefined;
+    send({ method: "item/completed", params: {
+      threadId, turnId, item: { type: "agentMessage", id: "approval-result", phase: "final_answer",
+        text: `approval:${message.result?.decision ?? JSON.stringify(message.result)}` }
+    } });
+    send({ method: "turn/completed", params: { threadId, turn: completedTurn(turnId, "completed") } });
+    activeTurns.delete(threadId);
+    return;
+  }
 
   if (message.method === "initialize") {
     if (message.jsonrpc) {
@@ -64,8 +76,12 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/start") {
-    if (message.params?.approvalPolicy !== "never") {
-      fail(message.id, "approvalPolicy must be never");
+    if (!["never", "on-request"].includes(message.params?.approvalPolicy)) {
+      fail(message.id, "invalid approvalPolicy");
+      return;
+    }
+    if (message.params.approvalPolicy === "on-request" && message.params.sandbox !== "workspaceWrite") {
+      fail(message.id, "approval turns need workspaceWrite sandbox");
       return;
     }
     respond(message.id, {
@@ -77,6 +93,10 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "thread/resume") {
+    if (message.params.threadId === "thread-missing") {
+      fail(message.id, "no rollout found for thread id thread-missing");
+      return;
+    }
     respond(message.id, {
       thread: { id: message.params.threadId },
       model: "resumed-model",
@@ -169,8 +189,33 @@ rl.on("line", (line) => {
       fail(message.id, "turn/start requires text input");
       return;
     }
+    if (message.params.approvalPolicy === "on-request" &&
+      (message.params.sandboxPolicy?.type !== "workspaceWrite" ||
+        message.params.sandboxPolicy?.writableRoots?.length !== 1 ||
+        message.params.sandboxPolicy.writableRoots[0] !== message.params.cwd ||
+        message.params.sandboxPolicy.networkAccess !== true)) {
+      fail(message.id, "approval turns need a workspace-scoped sandbox");
+      return;
+    }
     activeTurns.set(message.params.threadId, turnId);
     respond(message.id, { turn: completedTurn(turnId, "inProgress") });
+    if (prompt === "approval" || prompt === "permissions") {
+      if (message.params.approvalPolicy !== "on-request") {
+        fail(message.id, "approval requires on-request policy");
+        return;
+      }
+      pendingApproval = { threadId: message.params.threadId, turnId };
+      send(prompt === "permissions"
+        ? { id: "approval-1", method: "item/permissions/requestApproval", params: {
+          threadId: message.params.threadId, turnId, itemId: "permissions-1",
+          permissions: { network: { enabled: true }, fileSystem: null }, reason: "test network"
+        } }
+        : { id: "approval-1", method: "item/commandExecution/requestApproval", params: {
+          threadId: message.params.threadId, turnId, itemId: "command-1",
+          command: "touch approved", cwd: message.params.cwd, reason: "test approval"
+        } });
+      return;
+    }
     if (prompt === "hold") {
       return;
     }

@@ -16,7 +16,20 @@ export type CodexRunnerInput = {
   effort?: string;
   onDelta?: (delta: string) => Promise<void> | void;
   onProgress?: (message: string) => Promise<void> | void;
+  onApproval?: (request: CodexApprovalRequest) => Promise<boolean>;
 };
+
+export type CodexApprovalRequest = {
+  method: string;
+  params: Record<string, unknown>;
+};
+
+export class CodexThreadUnavailableError extends Error {
+  constructor(public readonly threadId: string) {
+    super(`Codex cannot resume thread ${threadId}: its rollout is unavailable`);
+    this.name = "CodexThreadUnavailableError";
+  }
+}
 
 export type CodexHistoryMessage = {
   id: string;
@@ -63,7 +76,7 @@ type TurnCompletion = {
 type TurnWaiter = {
   resolve: (value: CodexRunResult) => void;
   reject: (error: Error) => void;
-  timer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
 };
 
 type TurnStream = {
@@ -107,6 +120,8 @@ export class AppServerCodexRunner {
   private readonly queuedTurnEvents = new Map<string, QueuedTurnEvent[]>();
   private readonly itemPhasesByTurn = new Map<string, Map<string, string>>();
   private readonly runtimeInfoByThread = new Map<string, CodexRuntimeInfo>();
+  private readonly approvalHandlers = new Map<string, (request: CodexApprovalRequest) => Promise<boolean>>();
+  private readonly activeApprovalsByThread = new Map<string, number>();
   private modelOptions?: CodexModelOption[];
 
   constructor(private readonly options: AppServerRunnerOptions = {}) {}
@@ -114,50 +129,67 @@ export class AppServerCodexRunner {
   async run(input: CodexRunnerInput): Promise<CodexRunResult> {
     await this.ensureConnected();
 
-    const threadResponse = await this.request(
-      input.threadId ? "thread/resume" : "thread/start",
-      compactObject({
-        ...(input.threadId ? { threadId: input.threadId } : {}),
-        cwd: input.cwd,
-        model: input.model,
-        approvalPolicy: "never"
-      })
-    ) as Record<string, unknown>;
+    let threadResponse: Record<string, unknown>;
+    try {
+      threadResponse = await this.request(
+        input.threadId ? "thread/resume" : "thread/start",
+        compactObject({
+          ...(input.threadId ? { threadId: input.threadId } : {}),
+          cwd: input.cwd,
+          model: input.model,
+          approvalPolicy: input.onApproval ? "on-request" : "never",
+          ...(!input.threadId && input.onApproval ? { sandbox: "workspaceWrite" } : {})
+        })
+      ) as Record<string, unknown>;
+    } catch (error) {
+      if (input.threadId && error instanceof Error && /no rollout found for thread id/i.test(error.message)) {
+        throw new CodexThreadUnavailableError(input.threadId);
+      }
+      throw error;
+    }
     const thread = threadResponse.thread as Record<string, unknown> | undefined;
     const threadId = typeof thread?.id === "string" ? thread.id : input.threadId;
     if (!threadId) {
       throw new Error("Codex app-server did not return a thread id");
     }
     this.runtimeInfoByThread.set(threadId, runtimeInfoFromThreadResponse(threadResponse));
+    if (input.onApproval) this.approvalHandlers.set(threadId, input.onApproval);
 
-    const turnResponse = await this.request("turn/start", compactObject({
-      threadId,
-      input: [{ type: "text", text: input.prompt, text_elements: [] }],
-      cwd: input.cwd,
-      approvalPolicy: "never",
-      model: input.model,
-      effort: input.effort
-    })) as Record<string, unknown>;
-    const turn = turnResponse.turn as Record<string, unknown> | undefined;
-    const turnId = typeof turn?.id === "string" ? turn.id : undefined;
-    if (!turnId) {
-      throw new Error("Codex app-server did not return a turn id");
-    }
-
-    this.activeTurns.set(threadId, turnId);
-    if (input.onDelta || input.onProgress) {
-      const key = turnKey(threadId, turnId);
-      this.turnStreams.set(key, {
-        onDelta: input.onDelta,
-        onProgress: input.onProgress,
-        chain: Promise.resolve()
-      });
-      for (const event of this.queuedTurnEvents.get(key) ?? []) {
-        this.enqueueTurnEvent(key, event);
+    try {
+      const turnResponse = await this.request("turn/start", compactObject({
+        threadId,
+        input: [{ type: "text", text: input.prompt, text_elements: [] }],
+        cwd: input.cwd,
+        approvalPolicy: input.onApproval ? "on-request" : "never",
+        ...(input.onApproval ? {
+          sandboxPolicy: { type: "workspaceWrite", writableRoots: [input.cwd], networkAccess: true }
+        } : {}),
+        model: input.model,
+        effort: input.effort
+      })) as Record<string, unknown>;
+      const turn = turnResponse.turn as Record<string, unknown> | undefined;
+      const turnId = typeof turn?.id === "string" ? turn.id : undefined;
+      if (!turnId) {
+        throw new Error("Codex app-server did not return a turn id");
       }
-      this.queuedTurnEvents.delete(key);
+
+      this.activeTurns.set(threadId, turnId);
+      if (input.onDelta || input.onProgress) {
+        const key = turnKey(threadId, turnId);
+        this.turnStreams.set(key, {
+          onDelta: input.onDelta,
+          onProgress: input.onProgress,
+          chain: Promise.resolve()
+        });
+        for (const event of this.queuedTurnEvents.get(key) ?? []) {
+          this.enqueueTurnEvent(key, event);
+        }
+        this.queuedTurnEvents.delete(key);
+      }
+      return await this.waitForTurn(threadId, turnId);
+    } finally {
+      this.approvalHandlers.delete(threadId);
     }
-    return this.waitForTurn(threadId, turnId);
   }
 
   async listSessions(): Promise<unknown> {
@@ -444,13 +476,14 @@ export class AppServerCodexRunner {
       error: typeof errorValue?.message === "string" ? errorValue.message : undefined
     };
     this.activeTurns.delete(threadId);
+    this.activeApprovalsByThread.delete(threadId);
     const waiter = this.turnWaiters.get(key);
     if (!waiter) {
       this.completedTurns.set(key, completion);
       return;
     }
     this.turnWaiters.delete(key);
-    clearTimeout(waiter.timer);
+    if (waiter.timer) clearTimeout(waiter.timer);
     void this.finishTurn(threadId, key, completion, waiter.resolve, waiter.reject);
   }
 
@@ -464,16 +497,22 @@ export class AppServerCodexRunner {
       });
     }
 
-    const timeoutMs = this.options.requestTimeoutMs ?? 600_000;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.turnWaiters.delete(key);
-        const error = new Error(`app-server turn timed out after ${timeoutMs}ms`);
-        reject(error);
-        this.failTransport(error, true);
-      }, timeoutMs);
-      this.turnWaiters.set(key, { resolve, reject, timer });
+      const waiter: TurnWaiter = { resolve, reject };
+      this.turnWaiters.set(key, waiter);
+      this.startTurnTimeout(threadId, key, waiter);
     });
+  }
+
+  private startTurnTimeout(threadId: string, key: string, waiter: TurnWaiter): void {
+    if (this.activeApprovalsByThread.has(threadId) || waiter.timer) return;
+    const timeoutMs = this.options.requestTimeoutMs ?? 600_000;
+    waiter.timer = setTimeout(() => {
+      this.turnWaiters.delete(key);
+      const error = new Error(`app-server turn timed out after ${timeoutMs}ms`);
+      waiter.reject(error);
+      this.failTransport(error, true);
+    }, timeoutMs);
   }
 
   private async finishTurn(
@@ -531,20 +570,16 @@ export class AppServerCodexRunner {
     switch (message.method) {
       case "item/commandExecution/requestApproval":
       case "item/fileChange/requestApproval":
-        this.send({ id, result: { decision: "decline" } });
-        return;
+      case "item/permissions/requestApproval":
       case "execCommandApproval":
       case "applyPatchApproval":
-        this.send({ id, result: { decision: "denied" } });
+        void this.handleApprovalRequest(message);
         return;
       case "item/tool/requestUserInput":
         this.send({ id, result: { answers: {} } });
         return;
       case "mcpServer/elicitation/request":
         this.send({ id, result: { action: "cancel", content: null, _meta: null } });
-        return;
-      case "item/permissions/requestApproval":
-        this.send({ id, result: { permissions: {}, scope: "turn" } });
         return;
       case "item/tool/call":
         this.send({
@@ -563,6 +598,48 @@ export class AppServerCodexRunner {
           id,
           error: { code: -32601, message: `Unsupported app-server request: ${message.method ?? "unknown"}` }
         });
+    }
+  }
+
+  private async handleApprovalRequest(message: WireMessage): Promise<void> {
+    const child = this.child;
+    const params = message.params ?? {};
+    const threadId = typeof params.threadId === "string" ? params.threadId
+      : typeof params.conversationId === "string" ? params.conversationId : "";
+    if (threadId) {
+      this.activeApprovalsByThread.set(threadId, (this.activeApprovalsByThread.get(threadId) ?? 0) + 1);
+      const turnId = this.activeTurns.get(threadId);
+      const waiter = turnId ? this.turnWaiters.get(turnKey(threadId, turnId)) : undefined;
+      if (waiter?.timer) {
+        clearTimeout(waiter.timer);
+        waiter.timer = undefined;
+      }
+    }
+    let approved = false;
+    try {
+      approved = await (this.approvalHandlers.get(threadId)?.({ method: message.method ?? "", params }) ?? false);
+    } catch (error) {
+      console.warn(`Codex approval delivery failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const result = message.method === "item/permissions/requestApproval"
+      ? { permissions: approved ? grantedPermissions(params.permissions) : {}, scope: "turn" }
+      : { decision: message.method === "execCommandApproval" || message.method === "applyPatchApproval"
+        ? (approved ? "approved" : { denied: { rejection: "Rejected in WeChat" } })
+        : (approved ? "accept" : "decline") };
+    if (this.child === child) {
+      try { this.send({ id: message.id, result }); } catch { /* Transport already closed. */ }
+    }
+    if (threadId) {
+      const remaining = (this.activeApprovalsByThread.get(threadId) ?? 0) - 1;
+      if (remaining > 0) {
+        this.activeApprovalsByThread.set(threadId, remaining);
+      } else {
+        this.activeApprovalsByThread.delete(threadId);
+        const turnId = this.activeTurns.get(threadId);
+        const key = turnId ? turnKey(threadId, turnId) : undefined;
+        const waiter = key ? this.turnWaiters.get(key) : undefined;
+        if (key && waiter) this.startTurnTimeout(threadId, key, waiter);
+      }
     }
   }
 
@@ -589,7 +666,7 @@ export class AppServerCodexRunner {
     }
     for (const [key, waiter] of this.turnWaiters.entries()) {
       this.turnWaiters.delete(key);
-      clearTimeout(waiter.timer);
+      if (waiter.timer) clearTimeout(waiter.timer);
       waiter.reject(error);
     }
     this.activeTurns.clear();
@@ -600,6 +677,8 @@ export class AppServerCodexRunner {
     this.queuedTurnEvents.clear();
     this.itemPhasesByTurn.clear();
     this.runtimeInfoByThread.clear();
+    this.approvalHandlers.clear();
+    this.activeApprovalsByThread.clear();
     this.modelOptions = undefined;
   }
 }
@@ -608,6 +687,15 @@ function turnKeyFromParams(params: Record<string, unknown>): string | undefined 
   const threadId = typeof params.threadId === "string" ? params.threadId : undefined;
   const turnId = typeof params.turnId === "string" ? params.turnId : undefined;
   return threadId && turnId ? turnKey(threadId, turnId) : undefined;
+}
+
+function grantedPermissions(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const requested = value as Record<string, unknown>;
+  return compactObject({
+    network: requested.network ?? undefined,
+    fileSystem: requested.fileSystem ?? undefined
+  });
 }
 
 function parseModelOption(value: unknown): CodexModelOption | undefined {

@@ -158,6 +158,8 @@ npm start
 /prompt start                 开始缓冲多条微信消息
 /prompt done                  将缓冲内容作为一次 Codex turn 提交
 /stop                         中断当前 Codex 任务
+/approve                   同意当前权限请求
+/reject                    拒绝当前权限请求
 ```
 
 普通消息直接进入当前活动会话。图片、文件、视频和无转写语音会先保存到账号独立的入站目录，再以本地路径加入 prompt；有微信转写文本的语音优先使用转写文本。
@@ -182,9 +184,9 @@ Codex 可以在最终回复中声明需要发送的本机文件：
 
 ## Codex 后端
 
-默认的 `codexBackend` 是 `auto`。第一次收到 Codex 消息时，服务会启动一个持久的 `codex app-server --stdio` 进程，并使用新版 `initialize`、`thread/*` 和 `turn/*` 协议。新会话和已有会话都优先通过 app-server 运行；如果 app-server 无法启动、握手或处理请求，会自动回退到 `codex exec` 或 `codex exec resume`。
+默认的 `codexBackend` 是 `auto`。第一次收到 Codex 消息时，服务会启动一个持久的 `codex app-server --stdio` 进程，并使用新版 `initialize`、`thread/*` 和 `turn/*` 协议。新会话和已有会话都优先通过 app-server 运行；不需要交互审批的 turn 可在 app-server 不可用时回退到 `codex exec` 或 `codex exec resume`。微信发起的 turn 需要 app-server 才能处理审批，app-server 不可用时会报告错误。
 
-微信端目前没有 Codex 审批弹窗，因此 app-server 使用 `approvalPolicy: "never"`，只在现有 Codex sandbox 权限内执行，不会等待一个无法在微信中回答的本机审批请求。管理页仍可把后端固定为 `app-server` 或 `exec`，用于排查问题。
+微信发起的 Codex turn 使用 app-server 的 `approvalPolicy: "on-request"`，并明确启用绑定工作区的 `workspaceWrite` 沙盒和网络访问。在该沙盒内执行的命令无需审批；需要超出沙盒权限时，服务会向发起任务的微信联系人发送审批详情；直接发送 `/approve` 或 `/reject` 即可处理当前请求。同一联系人的多个请求会逐个展示，其他联系人不能代答；只要服务持续运行，未答复的请求会一直等待。发送 `/stop` 或停止服务会取消等待。当前 iLink 消息接口尚无已验证的原生按钮格式，因此微信端暂时使用文字命令。网页发起的 turn 仍沿用原有审批策略。
 
 ## 模型和推理强度
 

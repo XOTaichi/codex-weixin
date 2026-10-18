@@ -10,6 +10,7 @@ export type MonitorOptions = {
   onSyncKey?: (syncKey: string) => Promise<void> | void;
   claimMessage?: (message: NormalizedWeixinMessage) => boolean;
   onMessage: (message: NormalizedWeixinMessage) => Promise<void>;
+  isPriorityMessage?: (message: NormalizedWeixinMessage) => boolean;
   onMessageError?: (error: unknown, message: NormalizedWeixinMessage) => Promise<void> | void;
 };
 
@@ -39,6 +40,21 @@ export async function monitorWeixin(options: MonitorOptions): Promise<void> {
   let syncKey = options.initialSyncKey;
   const pollIntervalMs = options.pollIntervalMs ?? 1000;
   const retryBackoff = new PollRetryBackoff(pollIntervalMs, options.maxPollRetryMs ?? 30_000);
+  const senderTasks = new Map<string, Promise<void>>();
+  const activeTasks = new Set<Promise<void>>();
+  const handle = async (message: NormalizedWeixinMessage) => {
+    try {
+      console.log(`[codex-weixin] handling message ${message.id} from ${message.senderId}`);
+      await options.onMessage(message);
+      console.log(`[codex-weixin] handled message ${message.id} from ${message.senderId}`);
+    } catch (error) {
+      console.error(`[codex-weixin] message handling failed for ${message.senderId}: ${errorDetail(error)}`);
+      try { await options.onMessageError?.(error, message); }
+      catch (reportError) {
+        console.error(`[codex-weixin] failed to report message error for ${message.senderId}: ${errorDetail(reportError)}`);
+      }
+    }
+  };
   while (!options.signal?.aborted) {
     let batch: { syncKey?: string; messages: WeixinRawMessage[] };
     try {
@@ -69,27 +85,28 @@ export async function monitorWeixin(options: MonitorOptions): Promise<void> {
       if (!normalized) {
         continue;
       }
-      if (options.claimMessage && !options.claimMessage(normalized)) {
-        console.log(`[codex-weixin] skipped duplicate message ${normalized.id} from ${normalized.senderId}`);
+      const message = normalized;
+      if (options.claimMessage && !options.claimMessage(message)) {
+        console.log(`[codex-weixin] skipped duplicate message ${message.id} from ${message.senderId}`);
         continue;
       }
-      try {
-        console.log(`[codex-weixin] handling message ${normalized.id} from ${normalized.senderId}`);
-        await options.onMessage(normalized);
-        console.log(`[codex-weixin] handled message ${normalized.id} from ${normalized.senderId}`);
-      } catch (error) {
-        console.error(`[codex-weixin] message handling failed for ${normalized.senderId}: ${errorDetail(error)}`);
-        try {
-          await options.onMessageError?.(error, normalized);
-        } catch (reportError) {
-          console.error(`[codex-weixin] failed to report message error for ${normalized.senderId}: ${errorDetail(reportError)}`);
-        }
+      const priority = options.isPriorityMessage?.(message) ?? false;
+      const previous = priority ? undefined : senderTasks.get(message.senderId);
+      const task = previous ? previous.then(() => handle(message)) : handle(message);
+      if (!priority) {
+        senderTasks.set(message.senderId, task);
+        void task.finally(() => {
+          if (senderTasks.get(message.senderId) === task) senderTasks.delete(message.senderId);
+        });
       }
+      activeTasks.add(task);
+      void task.finally(() => activeTasks.delete(task));
     }
     if (!messages.length) {
       await delay(pollIntervalMs, options.signal);
     }
   }
+  await Promise.allSettled(activeTasks);
 }
 
 function parseUpdateBatch(value: unknown): { syncKey?: string; messages: WeixinRawMessage[] } {

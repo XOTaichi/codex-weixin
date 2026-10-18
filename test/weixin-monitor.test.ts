@@ -29,6 +29,34 @@ test("continues polling after a getUpdates failure", async (t) => {
   assert.equal(polls, 2);
 });
 
+test("processes approval replies while a sender's Codex turn is waiting", async (t) => {
+  t.mock.method(console, "log", () => {});
+  const controller = new AbortController();
+  let polls = 0;
+  let approve!: () => void;
+  const approval = new Promise<void>((resolve) => { approve = resolve; });
+  const handled: string[] = [];
+  const client = {
+    async getUpdates() {
+      polls += 1;
+      if (polls === 1) return { msgs: [{ message_id: "turn", from_user_id: "alice", text: "work" }] };
+      if (polls === 2) return { msgs: [{ message_id: "approve", from_user_id: "alice", text: "/approve" }] };
+      controller.abort();
+      return { msgs: [] };
+    }
+  } as WeixinApiClient;
+  await monitorWeixin({
+    client, signal: controller.signal, pollIntervalMs: 0,
+    isPriorityMessage: (message) => message.text.startsWith("/approve"),
+    async onMessage(message) {
+      if (message.id === "turn") await approval;
+      else approve();
+      handled.push(message.id);
+    }
+  });
+  assert.deepEqual(handled, ["approve", "turn"]);
+});
+
 test("continues polling after a malformed getUpdates response", async (t) => {
   t.mock.method(console, "error", () => {});
   const controller = new AbortController();
